@@ -58,7 +58,7 @@ class GeminiRewriter:
                     "responseMimeType": "application/json",
                 },
             }
-            for attempt in range(2):
+            for attempt in range(3):
                 try:
                     request = urllib.request.Request(
                         url,
@@ -69,7 +69,7 @@ class GeminiRewriter:
                         },
                         method="POST",
                     )
-                    with urllib.request.urlopen(request, timeout=60) as response:
+                    with urllib.request.urlopen(request, timeout=90) as response:
                         data = json.loads(response.read().decode("utf-8"))
                     candidates = data.get("candidates") if isinstance(data, dict) else None
                     if candidates:
@@ -77,7 +77,7 @@ class GeminiRewriter:
                 except urllib.error.HTTPError as exc:
                     last_http_error = exc
                     if exc.code in (429, 503):
-                        time.sleep(1 + attempt)
+                        time.sleep(2 + attempt * 2)
                         continue
                     if exc.code not in (404, 400):
                         status = exc.code
@@ -87,7 +87,10 @@ class GeminiRewriter:
                             message = "Не удалось получить ответ Gemini."
                         raise ProviderError(message) from None
                 except (urllib.error.URLError, TimeoutError):
-                    raise ProviderError("Не удалось подключиться к Gemini. Проверьте соединение.") from None
+                    if attempt < 2:
+                        time.sleep(2 + attempt * 2)
+                        continue
+                    last_http_error = None
                 except json.JSONDecodeError:
                     raise ProviderError("Gemini вернул некорректный ответ.") from None
             if candidates:
@@ -99,10 +102,14 @@ class GeminiRewriter:
                     message = "Gemini не принял ключ или доступ к модели. Проверьте настройки ИИ."
                 elif status == 429:
                     message = "Достигнут лимит Gemini. Подождите и повторите запрос."
-                else:
+                elif status == 503:
+                    message = "Gemini временно недоступен или перегружен. Повторите запрос позже."
+                elif status == 404:
                     message = "Gemini HTTP 404: ни одна доступная модель не найдена. Проверьте API key и включите Gemini API."
+                else:
+                    message = f"Gemini HTTP {status}: сервис отклонил запрос."
                 raise ProviderError(message)
-            raise ValueError("Ответ Gemini пуст или заблокирован.")
+            raise ProviderError("Не удалось подключиться к Gemini после повторных попыток. Проверьте доступ приложения к сети.")
 
         if not candidates:
             finish_reason = data.get("promptFeedback", {}).get("blockReason") if isinstance(data, dict) else None
