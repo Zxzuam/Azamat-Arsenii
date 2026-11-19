@@ -1,8 +1,11 @@
 import re
 import statistics
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 import pandas as pd
 import streamlit as st
-from groq import Groq
 
 from src.features import extract_features
 from src.normalize import calculate_readability_score
@@ -237,12 +240,12 @@ def get_parser_manager():
 st.set_page_config(page_title="Анализ и упрощение текста", layout="wide")
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
-# Боковая панель для настроек ИИ (Groq)
+# Боковая панель для настроек ИИ (Gemini)
 with st.sidebar:
     st.header("Настройки ИИ")
-    st.caption("Groq / Llama-3")
-    api_key = st.text_input("Groq API Key (gsk_...):", type="password")
-    st.markdown("[Получить бесплатный ключ](https://console.groq.com/keys)")
+    st.caption("Google Gemini")
+    api_key = st.text_input("Gemini API Key (AIza...):", type="password")
+    st.markdown("[Получить ключ Gemini](https://aistudio.google.com/app/apikey)")
     st.info("Ключ нужен только для перефразирования. Оценка читаемости работает локально.")
 
 render_hero()
@@ -314,36 +317,17 @@ if st.button("Рассчитать сложность", type="primary"):
 
 st.divider()
 
-# Блок 2: Интеграция LLM для перефразирования (через Groq API)
+# Блок 2: Интеграция LLM для перефразирования (через Gemini API)
 MAX_CHARS_PER_CHUNK = 1500   # длинный текст режется на куски, чтобы не упереться в лимит токенов
 MAX_OUTPUT_TOKENS = 2000
 
-SKIP_MODEL_KEYWORDS = ["guard", "whisper", "embed", "vision", "tts", "playai", "orpheus", "compound", "safeguard"]
-
-# Порядок: сначала модели с большим запасом по лимитам
-PREFERRED_MODELS = [
-    "llama-3.3-70b-versatile",
-    "openai/gpt-oss-120b",
-    "llama-3.1-8b-instant",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "openai/gpt-oss-20b",
-    "gemma2-9b-it",
-]
+GEMINI_MODEL = "gemini-2.5-flash"
 
 LANG_NAMES = {"en": "английский", "ru": "русский", "kk": "казахский"}
 
 # Ошибки, после которых имеет смысл попробовать другую модель
 RETRYABLE_MARKERS = ["413", "429", "rate_limit", "too large", "model_not_found",
                      "does not exist", "decommissioned", "not found"]
-
-
-def pick_models(client):
-    """Возвращает список подходящих текстовых моделей в порядке предпочтения."""
-    all_models = [m.id for m in client.models.list().data]
-    chat_models = [m for m in all_models if not any(k in m.lower() for k in SKIP_MODEL_KEYWORDS)]
-    ordered = [m for m in PREFERRED_MODELS if m in chat_models]
-    ordered += [m for m in chat_models if m not in ordered]
-    return ordered, all_models
 
 
 def split_into_chunks(paragraph, limit=MAX_CHARS_PER_CHUNK):
@@ -369,8 +353,8 @@ def split_into_chunks(paragraph, limit=MAX_CHARS_PER_CHUNK):
     return chunks
 
 
-def simplify_chunk(client, models, chunk, lang):
-    """Упрощает один кусок текста. При лимитах или недоступной модели пробует следующую."""
+def simplify_chunk(api_key, chunk, lang):
+    """Упрощает один кусок текста через Gemini."""
     system_prompt = (
         "Ты — эксперт в образовании. Адаптируй и упрости учебный текст, чтобы снизить "
         "языковой барьер для ученика. Сделай сложные синтаксические конструкции проще, "
@@ -378,68 +362,55 @@ def simplify_chunk(client, models, chunk, lang):
         "числа и ссылки вида [46]. Пиши только готовый перефразированный текст, без пояснений. "
         f"Язык ответа: {LANG_NAMES.get(lang, lang)}."
     )
-    last_error = None
-    for model in list(models):
-        kwargs = {}
-        if "gpt-oss" in model:
-            kwargs["reasoning_effort"] = "low"  # меньше токенов уходит на «размышления»
-        try:
-            completion = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": chunk},
-                ],
-                temperature=0.3,
-                max_tokens=MAX_OUTPUT_TOKENS,
-                **kwargs,
-            )
-        except Exception as e:
-            last_error = e
-            if any(marker in str(e).lower() for marker in RETRYABLE_MARKERS):
-                continue
-            raise
-        text = completion.choices[0].message.content or ""
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
-        models.remove(model)   # рабочую модель ставим первой для следующих кусков
-        models.insert(0, model)
-        return text, model
-    raise last_error if last_error else RuntimeError("Нет доступных моделей")
+    model = urllib.parse.quote(GEMINI_MODEL, safe="")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {
+        "systemInstruction": {"parts": [{"text": system_prompt}]},
+        "contents": [{"role": "user", "parts": [{"text": chunk}]}],
+        "generationConfig": {"temperature": 0.3, "maxOutputTokens": MAX_OUTPUT_TOKENS},
+    }
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("Gemini не вернул текст. Запрос мог быть заблокирован.")
+    parts = candidates[0].get("content", {}).get("parts", [])
+    return "".join(part.get("text", "") for part in parts if isinstance(part, dict)).strip()
 
 
 st.subheader("Автоматическое упрощение текста")
 if st.button("Перефразировать"):
     if not api_key:
-        st.error("Введите API ключ Groq в боковой панели слева (начинается с gsk_).")
+        st.error("Введите API ключ Gemini в боковой панели слева (начинается с AIza).")
     elif not text_input.strip():
         st.warning("Введите текст для упрощения.")
     else:
         try:
-            client = Groq(api_key=api_key.strip())
-            models, all_models = pick_models(client)
+            paragraphs = [p for p in re.split(r"\n\s*\n", text_input) if p.strip()]
+            plan = [split_into_chunks(p) for p in paragraphs]
+            total = sum(len(c) for c in plan)
 
-            if not models:
-                st.error(f"Не найдено генеративных моделей. Доступные модели: {all_models}")
-            else:
-                paragraphs = [p for p in re.split(r"\n\s*\n", text_input) if p.strip()]
-                plan = [split_into_chunks(p) for p in paragraphs]
-                total = sum(len(c) for c in plan)
+            progress = st.progress(0.0, text="Упрощаем текст...")
+            done, result_paragraphs = 0, []
+            for chunks in plan:
+                parts = []
+                for chunk in chunks:
+                    text = simplify_chunk(api_key.strip(), chunk, lang)
+                    parts.append(text)
+                    done += 1
+                    progress.progress(done / total, text=f"Готово {done} из {total}")
+                result_paragraphs.append(" ".join(parts))
+            progress.empty()
 
-                progress = st.progress(0.0, text="Упрощаем текст...")
-                done, used_model, result_paragraphs = 0, None, []
-                for chunks in plan:
-                    parts = []
-                    for chunk in chunks:
-                        text, used_model = simplify_chunk(client, models, chunk, lang)
-                        parts.append(text)
-                        done += 1
-                        progress.progress(done / total, text=f"Готово {done} из {total}")
-                    result_paragraphs.append(" ".join(parts))
-                progress.empty()
-
-                st.success(f"Текст упрощен. Модель: {used_model}")
-                with st.container(border=True):
-                    st.markdown("\n\n".join(result_paragraphs))
+            st.success(f"Текст упрощен. Модель: {GEMINI_MODEL}")
+            with st.container(border=True):
+                st.markdown("\n\n".join(result_paragraphs))
 
         except Exception as e:
-            st.error(f"Сбой сервера Groq. Детали ошибки: {e}")
+            st.error(f"Сбой сервера Gemini. Детали ошибки: {e}")

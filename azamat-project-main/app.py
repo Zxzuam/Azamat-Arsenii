@@ -16,7 +16,7 @@ from readable.core import (
 )
 from readable.examples import EXAMPLES, LEVEL_NAMES, SAMPLE_TEXTS
 from readable.nlp import NLPAnalyzer
-from readable.provider import DEFAULT_MODEL, GroqRewriter
+from readable.provider import DEFAULT_MODEL, GeminiRewriter
 
 st.set_page_config(page_title="READABLE. — текст проще", page_icon="📖",
                    layout="wide", initial_sidebar_state="expanded")
@@ -96,24 +96,20 @@ def run_pending_action() -> None:
             state.result = Result(state.analysis.fingerprint, state.threshold, ())
             state.notice = ("success", "Предложений с оценкой ≤ X нет. Текст уже подходит под выбранный порог.")
             return
-        api_key = state.api_key.strip() or setting("GROQ_API_KEY").strip()
+        api_key = state.api_key.strip() or setting("GEMINI_API_KEY").strip()
         if not api_key:
-            state.notice = ("warning", "Для упрощения укажите Groq API key в настройках ИИ слева. Анализ уже готов.")
+            state.notice = ("warning", "Для упрощения укажите Gemini API key в настройках ИИ слева. Анализ уже готов.")
             return
-        from groq import Groq
-
-        model = setting("GROQ_MODEL", DEFAULT_MODEL)
+        model = setting("GEMINI_MODEL", DEFAULT_MODEL)
         bar = st.progress(0.0, text=f"Упрощаем выбранные предложения: {len(selected)}")
         try:
-            # max_retries=5 позволяет автоматом переждать лимиты Groq (Rate Limits)
-            with Groq(api_key=api_key, timeout=60.0, max_retries=5) as client:
-                state.result = simplify(
-                    state.analysis, state.threshold, GroqRewriter(client, model),
-                    get_analyzer().score_rewrite, state.rewrite_cache, model,
-                    progress=lambda done, total: bar.progress(
-                        done / total, text=f"Обработано {done} из {total} выбранных предложений"
-                    ),
-                )
+            state.result = simplify(
+                state.analysis, state.threshold, GeminiRewriter(api_key, model),
+                get_analyzer().score_rewrite, state.rewrite_cache, model,
+                progress=lambda done, total: bar.progress(
+                    done / total, text=f"Обработано {done} из {total} выбранных предложений"
+                ),
+            )
         finally:
             bar.empty()
             gc.collect()
@@ -124,7 +120,7 @@ def run_pending_action() -> None:
     except RuntimeError:
         state.notice = ("error", "Не удалось загрузить языковую модель. Проверьте spaCy/Stanza и скачайте модель выбранного языка по инструкции README_RU.md.")
     except Exception as exc:
-        state.notice = ("error", f"Ошибка обработки: {str(exc)}. Если превышен лимит API Groq, подождите 1 минуту.")
+        state.notice = ("error", f"Ошибка обработки: {str(exc)}. Если превышен лимит API Gemini, подождите 1 минуту.")
     finally:
         gc.collect()
 
@@ -153,11 +149,11 @@ def render_sidebar() -> None:
                f'<p>{html.escape(EXAMPLES[lang][level])}</p></div>')
         st.caption("Одна мысль, разная подача. Уровни условные: это ориентиры, а не измерения вашей модели.")
         with st.expander("Настройки ИИ", expanded=False):
-            st.text_input("Groq API key", type="password", key="api_key", placeholder="gsk_…")
-            if setting("GROQ_API_KEY"):
+            st.text_input("Gemini API key", type="password", key="api_key", placeholder="AIza…")
+            if setting("GEMINI_API_KEY"):
                 st.caption("Ключ сервера настроен. Поле выше можно оставить пустым.")
-            st.markdown("[Получить ключ Groq](https://console.groq.com/keys)")
-            st.caption("Анализ выполняется локально. В Groq отправляются только выбранные предложения после нажатия «Упростить».")
+            st.markdown("[Получить ключ Gemini](https://aistudio.google.com/app/apikey)")
+            st.caption("Анализ выполняется локально. В Gemini отправляются только выбранные предложения после нажатия «Упростить».")
         markup('<div class="sidebar-foot">0 — очень сложно<br>100 — очень легко</div>')
 
 

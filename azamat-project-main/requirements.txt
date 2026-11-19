@@ -11,4 +11,3 @@ statsmodels
 streamlit
 sentencepiece
 protobuf
-groq

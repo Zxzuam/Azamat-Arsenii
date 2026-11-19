@@ -1,15 +1,18 @@
-"""Groq transport. Only selected sentences enter the JSON request."""
+"""Google Gemini transport. Only selected sentences enter the JSON request."""
 from __future__ import annotations
 
 import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Sequence
 
 from .core import LANGUAGES, ProviderError, SentenceScore, decode_response
 
-DEFAULT_MODEL = "openai/gpt-oss-20b"
+DEFAULT_MODEL = "gemini-2.5-flash"
 
 
-class GroqRewriter:
+class GeminiRewriter:
     def __init__(self, client, model: str = DEFAULT_MODEL):
         self.client = client
         self.model = model
@@ -32,41 +35,53 @@ class GroqRewriter:
         )
         payload = {"items": [{"id": s.id, "text": s.text} for s in sentences]}
         try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "system", "content": system},
-                          {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
-                response_format={"type": "json_object"},
-                temperature=0.2,
-                max_completion_tokens=6000,
+            model = urllib.parse.quote(self.model, safe="")
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+            request_body = {
+                "systemInstruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": json.dumps(payload, ensure_ascii=False)}]}],
+                "generationConfig": {
+                    "temperature": 0.2,
+                    "maxOutputTokens": 6000,
+                    "responseMimeType": "application/json",
+                },
+            }
+            request = urllib.request.Request(
+                url,
+                data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": self.client,
+                },
+                method="POST",
             )
-        except Exception as exc:
-            status = getattr(exc, "status_code", None)
+            with urllib.request.urlopen(request, timeout=60) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            status = exc.code
             if status in (401, 403):
-                message = "Groq не принял ключ или доступ к модели. Проверьте настройки ИИ."
+                message = "Gemini не принял ключ или доступ к модели. Проверьте настройки ИИ."
             elif status == 429:
-                message = "Достигнут лимит Groq. Подождите и повторите запрос."
+                message = "Достигнут лимит Gemini. Подождите и повторите запрос."
             elif status in (400, 404):
-                body = getattr(exc, "body", None)
-                error = body.get("error", body) if isinstance(body, dict) else {}
-                detail = (
-                    str(error.get("message", "Нет подробностей"))
-                    if isinstance(error, dict)
-                    else "Нет подробностей"
-                )
-
-                # Скрываем ключ, если он встретится в сообщении.
-                key = getattr(self.client, "api_key", "")
-                if key:
-                    detail = detail.replace(key, "[ключ скрыт]")
-
-                message = f"Groq HTTP {status}: {detail[:800]}"
-            elif status is not None and status >= 500:
-                message = "Groq временно недоступен. Попробуйте позже."
+                message = f"Gemini HTTP {status}: модель или запрос отклонён."
+            elif status >= 500:
+                message = "Gemini временно недоступен. Попробуйте позже."
             else:
-                message = "Не удалось получить ответ Groq. Проверьте соединение и повторите."
+                message = "Не удалось получить ответ Gemini."
             raise ProviderError(message) from None
-        if not response.choices or response.choices[0].finish_reason != "stop":
-            raise ValueError("Ответ обрезан или не завершён.")
-        return decode_response(response.choices[0].message.content or "",
-                               {s.id for s in sentences})
+        except (urllib.error.URLError, TimeoutError):
+            raise ProviderError("Не удалось подключиться к Gemini. Проверьте соединение.") from None
+        except json.JSONDecodeError:
+            raise ProviderError("Gemini вернул некорректный ответ.") from None
+
+        candidates = data.get("candidates") if isinstance(data, dict) else None
+        if not candidates:
+            finish_reason = data.get("promptFeedback", {}).get("blockReason") if isinstance(data, dict) else None
+            detail = f" Причина: {finish_reason}" if finish_reason else ""
+            raise ValueError(f"Ответ Gemini пуст или заблокирован.{detail}")
+        parts = candidates[0].get("content", {}).get("parts", [])
+        content = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
+        if candidates[0].get("finishReason") not in (None, "STOP"):
+            raise ValueError("Ответ Gemini обрезан или не завершён.")
+        return decode_response(content, {s.id for s in sentences})
