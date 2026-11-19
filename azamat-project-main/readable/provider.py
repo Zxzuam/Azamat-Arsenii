@@ -5,6 +5,7 @@ import json
 import urllib.error
 import urllib.parse
 import urllib.request
+import time
 from typing import Sequence
 
 from .core import LANGUAGES, ProviderError, SentenceScore, decode_response
@@ -12,6 +13,7 @@ from .core import LANGUAGES, ProviderError, SentenceScore, decode_response
 DEFAULT_MODEL = "gemini-2.5-flash"
 FALLBACK_MODELS = (
     "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
     "gemini-flash-latest",
     "gemini-2.0-flash",
 )
@@ -56,38 +58,40 @@ class GeminiRewriter:
                     "responseMimeType": "application/json",
                 },
             }
-            try:
-                request = urllib.request.Request(
-                    url,
-                    data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
-                    headers={
-                        "Content-Type": "application/json",
-                        "x-goog-api-key": self.client,
-                    },
-                    method="POST",
-                )
-                with urllib.request.urlopen(request, timeout=60) as response:
-                    data = json.loads(response.read().decode("utf-8"))
-                candidates = data.get("candidates") if isinstance(data, dict) else None
-                if candidates:
-                    break
-            except urllib.error.HTTPError as exc:
-                last_http_error = exc
-                if exc.code not in (404, 400):
-                    status = exc.code
-                    if status in (401, 403):
-                        message = "Gemini не принял ключ или доступ к модели. Проверьте настройки ИИ."
-                    elif status == 429:
-                        message = "Достигнут лимит Gemini. Подождите и повторите запрос."
-                    elif status >= 500:
-                        message = "Gemini временно недоступен. Попробуйте позже."
-                    else:
-                        message = "Не удалось получить ответ Gemini."
-                    raise ProviderError(message) from None
-            except (urllib.error.URLError, TimeoutError):
-                raise ProviderError("Не удалось подключиться к Gemini. Проверьте соединение.") from None
-            except json.JSONDecodeError:
-                raise ProviderError("Gemini вернул некорректный ответ.") from None
+            for attempt in range(2):
+                try:
+                    request = urllib.request.Request(
+                        url,
+                        data=json.dumps(request_body, ensure_ascii=False).encode("utf-8"),
+                        headers={
+                            "Content-Type": "application/json",
+                            "x-goog-api-key": self.client,
+                        },
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(request, timeout=60) as response:
+                        data = json.loads(response.read().decode("utf-8"))
+                    candidates = data.get("candidates") if isinstance(data, dict) else None
+                    if candidates:
+                        break
+                except urllib.error.HTTPError as exc:
+                    last_http_error = exc
+                    if exc.code in (429, 503):
+                        time.sleep(1 + attempt)
+                        continue
+                    if exc.code not in (404, 400):
+                        status = exc.code
+                        if status in (401, 403):
+                            message = "Gemini не принял ключ или доступ к модели. Проверьте настройки ИИ."
+                        else:
+                            message = "Не удалось получить ответ Gemini."
+                        raise ProviderError(message) from None
+                except (urllib.error.URLError, TimeoutError):
+                    raise ProviderError("Не удалось подключиться к Gemini. Проверьте соединение.") from None
+                except json.JSONDecodeError:
+                    raise ProviderError("Gemini вернул некорректный ответ.") from None
+            if candidates:
+                break
         else:
             if last_http_error is not None:
                 status = last_http_error.code
